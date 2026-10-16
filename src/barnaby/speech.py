@@ -48,7 +48,7 @@ class SpeechWorker:
                 f"Piper voice not found: {self.voice_path}"
             )
 
-        for executable in ("sox", "aplay"):
+        for executable in ("sox", "pw-play"):
             if shutil.which(executable) is None:
                 raise RuntimeError(
                     f"{executable} is missing. Install sox and alsa-utils."
@@ -140,7 +140,7 @@ class SpeechWorker:
 
             # 3. Play through Raspberry Pi audio output.
             process = subprocess.Popen(
-                ["aplay", "-q", str(demon_wav)],
+                ["pw-play", str(demon_wav)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )

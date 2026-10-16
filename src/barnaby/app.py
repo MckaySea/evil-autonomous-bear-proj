@@ -15,7 +15,8 @@ from .models import DEFAULT_MODEL_DIR
 from .reactions import PerceptionEvent, on_perception, on_scene_description
 from .scene import MODEL, describe_scene
 from .vision import Observation, Vision
-
+from pathlib import Path
+from dotenv import load_dotenv
 
 def positive(value: str) -> int:
     number = int(value)
@@ -39,6 +40,7 @@ def overlay(frame, observation: Observation, gesture: str, expression: str):
 
 
 def main(argv=None) -> None:
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="0", help="USB camera index or video path")
     parser.add_argument("--picamera", action="store_true", help="Use a Pi CSI camera via Picamera2")
