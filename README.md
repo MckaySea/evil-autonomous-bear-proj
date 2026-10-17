@@ -183,7 +183,7 @@ The `src/barnaby/sounds.py` mappings are `middle_finger -> growl.wav` and `peace
 
 Speech and effects share one audio worker, so they never play over each other. A held gesture triggers once and must disappear for 0.5 seconds before it can trigger again. Facial-expression changes do not retrigger the held hand gesture. A gesture attempted during its cooldown is ignored until it is released and performed again.
 
-The queue holds at most two waiting effects and the newest waiting observation. Duplicates are ignored. A waiting observation can have at most one effect ahead of it (including an effect already playing); replacing its text preserves that turn. Expired items are discarded, and audio already playing finishes without interruption.
+The queue holds at most two waiting effects and the newest waiting observation. Duplicates are ignored. A fresh waiting observation always plays next, ahead of all waiting effects; replacing its text preserves that priority. Expired items are discarded, and audio already playing finishes without interruption. The silence gap still applies between playback items.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

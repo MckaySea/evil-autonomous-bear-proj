@@ -69,13 +69,11 @@ class AudioSchedule:
         self.current: AudioItem | None = None
         self.cooldown_until: dict[str, float] = {}
         self.next_play_at = 0.0
-        self._effect_ahead = False
 
     def prune(self, now: float) -> None:
         self.effects = deque(item for item in self.effects if item.expires_at > now)
         if self.observation is not None and self.observation.expires_at <= now:
             self.observation = None
-            self._effect_ahead = False
 
     def add_effect(self, name: str, now: float) -> bool:
         self.prune(now)
@@ -95,8 +93,6 @@ class AudioSchedule:
             return False
         if self.observation is not None and captured_at < self.observation.created_at:
             return False
-        if self.observation is None:
-            self._effect_ahead = self.current is not None and self.current.kind == "effect"
         self.observation = AudioItem("observation", text, captured_at, expires_at)
         return True
 
@@ -110,13 +106,11 @@ class AudioSchedule:
         self.prune(now)
         if self.current is not None or now < self.next_play_at:
             return None
-        if self.observation is not None and (self._effect_ahead or not self.effects):
+        # Fresh speech always goes before waiting effects; active audio finishes.
+        if self.observation is not None:
             self.current, self.observation = self.observation, None
-            self._effect_ahead = False
         elif self.effects:
             self.current = self.effects.popleft()
-            if self.observation is not None:
-                self._effect_ahead = True
         return self.current
 
     def finish(self, now: float, played: bool) -> None:
