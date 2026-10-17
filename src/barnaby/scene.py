@@ -22,6 +22,7 @@ def describe_scene(
     *,
     image_width: int = 512,
     timeout: float = 25.0,
+    recognized_name: str | None = None,
 ) -> str:
     """Send one BGR camera snapshot to Gemini and return a text description."""
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -54,11 +55,18 @@ def describe_scene(
         api_key=api_key,
         http_options=types.HttpOptions(timeout=int(timeout * 1000)),
     )
+    prompt = PROMPT
+    if recognized_name:
+        prompt += (
+            " The visitor voluntarily enrolled and their recognized name is "
+            + repr(recognized_name) + ". Address them by name naturally. "
+            "Do not invent other personal details."
+        )
     try:
         response = client.interactions.create(
             model=model,
             input=[
-                {"type": "text", "text": PROMPT},
+                {"type": "text", "text": prompt},
                 {
                     "type": "image",
                     "data": base64.b64encode(jpeg.tobytes()).decode("ascii"),

@@ -30,3 +30,4 @@ voices/*
 .DS_Store
 Thumbs.db
 .idea/
+models/face_recognition_sface_2021dec.onnx

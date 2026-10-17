@@ -35,6 +35,8 @@ def classify_gesture(points: np.ndarray) -> str:
         return "pointing"
     if fingers == [False, True, False, False]:
         return "middle_finger"
+    if fingers == [True, False, False, True]:
+        return "horns"
     if not any(fingers):
         palm_size = float(np.linalg.norm(points[0] - points[9]))
         upward = points[2, 1] - points[4, 1]

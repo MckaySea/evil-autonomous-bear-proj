@@ -18,6 +18,9 @@ class PerceptionEvent:
 def on_perception(event: PerceptionEvent) -> None:
     """Called on stable gesture/expression changes."""
     print(json.dumps(event.__dict__), flush=True)
+    if event.gesture == "middle_finger":
+        speak("You suck man")
+
 
 
 def on_scene_description(description: str) -> None:

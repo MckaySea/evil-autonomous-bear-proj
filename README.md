@@ -29,6 +29,19 @@ USB webcam:
 
 ```bash
 python -m barnaby --source 0
+
+
+python -m barnaby   --source 0   --faces   --face-interval 1.5   --scene   --scene-model gemini-3.5-flash-lite   --scene-interval 45   --scene-timeout 90   --scene-image-width 320   --threads 3
+
+
+test face recon only:
+ python -m barnaby.face_memory test --source 0
+
+
+add faces 
+
+python -m barnaby.face_memory enroll   --name "namehere"   --source 0   --samples 5
+
 ```
 
 Use `--source 1` if the camera is on a different index.

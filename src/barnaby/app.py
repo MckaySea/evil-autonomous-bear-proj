@@ -10,6 +10,7 @@ import time
 import cv2
 
 from .camera import Camera
+from .face_memory import FaceMemory, DEFAULT_THRESHOLD
 from .gestures import HAND_CONNECTIONS, StableLabel
 from .models import DEFAULT_MODEL_DIR
 from .reactions import PerceptionEvent, on_perception, on_scene_description
@@ -25,7 +26,7 @@ def positive(value: str) -> int:
     return number
 
 
-def overlay(frame, observation: Observation, gesture: str, expression: str):
+def overlay(frame, observation: Observation, gesture: str, expression: str, person=None):
     if observation.face_box:
         x, y, w, h = observation.face_box
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 0), 2)
@@ -37,6 +38,9 @@ def overlay(frame, observation: Observation, gesture: str, expression: str):
             cv2.circle(frame, tuple(point), 3, (0, 240, 255), -1)
     text = f"Gesture: {gesture} | Expression: {expression} | {observation.inference_ms:.0f} ms"
     cv2.putText(frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 240, 255), 1, cv2.LINE_AA)
+    if person:
+        cv2.putText(frame, f"Recognized: {person}", (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 240, 255), 2, cv2.LINE_AA)
 
 
 def main(argv=None) -> None:
@@ -50,6 +54,11 @@ def main(argv=None) -> None:
     parser.add_argument("--inference-width", type=positive, default=320, help="Downscale inference to save CPU")
     parser.add_argument("--interval", type=float, default=0.15, help="Minimum seconds between inference starts")
     parser.add_argument("--threads", type=positive, default=2)
+    parser.add_argument("--faces", action="store_true", help="Recognize enrolled people locally")
+    parser.add_argument("--face-interval", type=float, default=1.5,
+                        help="Seconds between SFace recognition attempts")
+    parser.add_argument("--face-threshold", type=float, default=DEFAULT_THRESHOLD,
+                        help="Minimum cosine similarity for a known person")
     parser.add_argument("--stable-frames", type=positive, default=3, help="Consecutive inference observations")
     parser.add_argument("--headless", action="store_true", help="Print events without a preview window")
     parser.add_argument("--max-frames", type=positive, help="Stop after this many captured frames")
@@ -75,6 +84,10 @@ def main(argv=None) -> None:
         parser.error("--scene-interval must be finite and positive")
     if not math.isfinite(args.scene_timeout) or args.scene_timeout <= 0:
         parser.error("--scene-timeout must be finite and positive")
+    if not math.isfinite(args.face_interval) or args.face_interval <= 0:
+        parser.error("--face-interval must be finite and positive")
+    if not math.isfinite(args.face_threshold) or not -1 <= args.face_threshold <= 1:
+        parser.error("--face-threshold must be between -1 and 1")
     if args.scene and not args.check and not os.getenv("GEMINI_API_KEY"):
         parser.error("GEMINI_API_KEY must be set when --scene is enabled")
     if args.save_video and not args.picamera and not args.source.isdecimal():
@@ -86,6 +99,11 @@ def main(argv=None) -> None:
     scene_executor = None
     scene_future = None
     next_scene_at = 0.0
+    face_memory = None
+    next_face_at = 0.0
+    current_person = None
+    candidate_person = None
+    candidate_hits = 0
     try:
         vision = Vision(args.model_dir, args.threads)
         if args.check:
@@ -93,6 +111,9 @@ def main(argv=None) -> None:
             print(f"All four models verified and ran on CPU (OpenCV {cv2.__version__}).")
             return
 
+        if args.faces:
+            face_memory = FaceMemory(args.model_dir)
+            print("Local SFace recognition enabled; requires two matching checks")
         camera = Camera(args.source, args.width, args.height, args.picamera, args.realtime, args.loop)
         if args.scene:
             scene_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="barnaby-gemini")
@@ -133,6 +154,20 @@ def main(argv=None) -> None:
                                                    observation.face_confidence, observation.inference_ms))
                     previous = labels
 
+            if face_memory is not None and now >= next_face_at:
+                next_face_at = now + args.face_interval
+                # Run on the full-resolution frame, not the smaller hand-inference image.
+                person, similarity = face_memory.recognize(frame, args.face_threshold)
+                if person == candidate_person:
+                    candidate_hits += 1
+                else:
+                    candidate_person, candidate_hits = person, 1
+                if candidate_hits >= 2 and current_person != candidate_person:
+                    current_person = candidate_person
+                    if current_person:
+                        print(f"[Barnaby recognizes] {current_person} "
+                              f"(similarity {similarity:.3f})", flush=True)
+
             if scene_executor is not None:
                 # Consume finished Gemini responses without waiting for the network.
                 if scene_future is not None and scene_future.done():
@@ -155,11 +190,13 @@ def main(argv=None) -> None:
                         args.scene_model,
                         image_width=args.scene_image_width,
                         timeout=args.scene_timeout,
+                        recognized_name=current_person,
                     )
                     next_scene_at = time.monotonic() + args.scene_interval
 
             if not args.headless or args.save_video:
-                overlay(small, observation, gesture_filter.value, expression_filter.value)
+                overlay(small, observation, gesture_filter.value,
+                        expression_filter.value, current_person)
             if args.save_video:
                 if writer is None:
                     args.save_video.parent.mkdir(parents=True, exist_ok=True)
@@ -185,6 +222,8 @@ def main(argv=None) -> None:
     finally:
         if scene_executor is not None:
             scene_executor.shutdown(wait=False, cancel_futures=True)
+        if face_memory is not None:
+            face_memory.close()
         if writer is not None:
             writer.release()
         if camera is not None:
