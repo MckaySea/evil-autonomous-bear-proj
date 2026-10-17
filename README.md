@@ -1,97 +1,352 @@
-# Barnaby Bear
+# Barnaby Bear — Setup & Development Guide
 
-Python and OpenCV for hand gestures and facial expressions on a Pi 5.
-The four model files are included in the repo. Demo videos are downloaded separately.
+Barnaby is a Halloween animatronic project built with Python and OpenCV. It detects hand gestures and facial expressions locally, recognizes previously enrolled faces with SFace, generates creepy/funny commentary with Gemini, speaks via Piper + SoX, and plays prerecorded sounds with `pygame.mixer`.
 
-## Set up on Linux
+**Primary target:** Raspberry Pi 5 (64-bit Raspberry Pi OS). The USB webcam path also works on a Linux desktop with a compatible Python/OpenCV setup. The full audio stack currently assumes Linux + PipeWire.
 
-Use 64-bit Raspberry Pi OS and Python 3.10-3.13.
-Replace YOUR_REPO_URL with your GitHub repo URL.
+## What runs where
+
+| Component | Implementation | Runs on |
+| --- | --- | --- |
+| Palm and hand detection | OpenCV Zoo / MediaPipe ONNX models | Local CPU |
+| Gesture classification | Hand-landmark rules in `gestures.py` | Local CPU |
+| Face detection | YuNet | Local CPU |
+| Facial expression classification | MobileFaceNet FER | Local CPU |
+| Known-person recognition | SFace + SQLite (`data/faces.db`) | Local CPU |
+| Scene descriptions and personalized dialogue | Gemini API | Cloud; requires internet/key |
+| Spoken dialogue | Piper Ryan Medium + SoX demon effects | Local CPU |
+| Prerecorded reactions | `pygame.mixer` | Local audio device |
+
+## 1. Clone and install (Pi 5 / Debian / Ubuntu Linux)
+
+Use a **64-bit OS**, Python **3.10–3.13**, an internet connection for initial setup, and a USB webcam. From a terminal:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3-venv libgl1 libglib2.0-0
-git clone YOUR_REPO_URL barnaby-proj
-cd barnaby-proj
+sudo apt install -y \
+  git curl python3-venv python3-pip \
+  libgl1 libglib2.0-0 v4l-utils \
+  sox libsox-fmt-all alsa-utils pipewire-bin \
+  libheif-examples
+
+git clone https://github.com/MckaySea/evil-autonomous-bear-proj.git
+cd evil-autonomous-bear-proj
+
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install --only-binary=:all: -r requirements.txt
+python -m pip install piper-tts google-genai python-dotenv pygame
+```
+
+**Important:** `requirements.txt` currently installs the core vision dependencies only. `pygame`, `piper-tts`, `google-genai` and `python-dotenv` must also be installed; `reactions.py` currently initializes pygame audio at import time, even for local-only runs. `pygame` needs a working audio device or SDL dummy output (see Troubleshooting).
+
+Always run Barnaby commands from the **repository root**, where `models/`, `sounds/` and `.env` reside. Activate `.venv` in every new terminal:
+
+```bash
+cd /path/to/evil-autonomous-bear-proj
+source .venv/bin/activate
+```
+
+### Windows or macOS development
+
+A Linux machine is easiest for the **complete** camera + Piper/SoX + PipeWire setup. On Windows use `py -3.12 -m venv .venv` and `.venv\Scripts\activate` (PowerShell: `.venv\Scripts\Activate.ps1`); on macOS use `python3 -m venv .venv` and `source .venv/bin/activate`. Install the Python requirements as above. Camera detection and face enrollment may work, but **`speech.py` currently calls Linux's `sox` and `pw-play`**, so spoken audio needs a platform-specific playback replacement on Windows/macOS. The camera and Linux Pi steps below are the supported project workflow.
+
+## 2. Check the models
+
+The four baseline vision ONNX models and the Piper Ryan voice files are currently in GitHub. Check them:
+
+```bash
+ls -lh models/
+ls -lh voices/
 python -m barnaby --check
 ```
 
-If you already cloned the repo, start at `cd barnaby-proj`.
-The check runs all four models without a camera.
+Expected voice files:
 
-## Run
+```text
+voices/en_US-ryan-medium.onnx
+voices/en_US-ryan-medium.onnx.json
+```
 
-USB webcam:
+If a baseline vision model is missing or corrupted, download and verify it using the pinned manifest:
 
 ```bash
+python -m barnaby.models
+```
+
+If the Piper voice files are missing:
+
+```bash
+python -m piper.download_voices --data-dir voices en_US-ryan-medium
+```
+
+### Install SFace for recognizing people
+
+**The SFace ONNX model is not tracked in Git**, so a fresh clone needs this additional download:
+
+```bash
+mkdir -p models
+curl -fL --retry 3 \
+  -o models/face_recognition_sface_2021dec.onnx \
+  'https://huggingface.co/opencv/opencv_zoo/resolve/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx'
+
+python - <<'PY'
+from pathlib import Path
+import cv2
+path = Path('models/face_recognition_sface_2021dec.onnx')
+recognizer = cv2.FaceRecognizerSF.create(str(path), '')
+print(f'SFace loaded successfully ({path.stat().st_size / 1e6:.1f} MB)')
+PY
+```
+
+If `--check` fails before this download, it may be because pygame audio initialization failed; see Troubleshooting. The `--check` command verifies only the four baseline networks, not SFace.
+
+## 3. Set up Gemini and Piper speech
+
+Create a local `.env` file at the **project root**:
+
+```bash
+nano .env
+```
+
+Contents:
+
+```dotenv
+GEMINI_API_KEY=YOUR_GOOGLE_AI_STUDIO_KEY
+BARNABY_TTS=1
+```
+
+Save, then restrict access:
+
+```bash
+chmod 600 .env
+```
+
+`src/barnaby/app.py` loads this file with `python-dotenv` automatically. `GEMINI_API_KEY` is required only when using `--scene`. `BARNABY_TTS=1` enables voice playback for Gemini descriptions. Without `--scene`, the local vision and face recognition can still run.
+
+Current voice effects in `src/barnaby/speech.py`: **SoX `pitch -650 tempo 0.90 reverb 30`**. Playback uses the `pw-play` executable (with a hyphen, not `pwplay`).
+
+Test Piper without waiting for Gemini:
+
+```bash
+BARNABY_TTS=1 python - <<'PY'
+from barnaby.speech import speak
+import time
+speak('Hello, little human. Barnaby has awakened.')
+time.sleep(20)
+PY
+```
+
+You should see `[Barnaby TTS] Piper voice loaded` and hear audio. If no sound plays, confirm `command -v sox` and `command -v pw-play`, then check the audio output below.
+
+## 4. Select the camera
+
+For a USB webcam:
+
+```bash
+ls -l /dev/video*
+v4l2-ctl --list-devices
 python -m barnaby --source 0
-
-
-python -m barnaby   --source 0   --faces   --face-interval 1.5   --scene   --scene-model gemini-3.5-flash-lite   --scene-interval 45   --scene-timeout 90   --scene-image-width 320   --threads 3
-
-
-test face recon only:
- python -m barnaby.face_memory test --source 0
-
-
-add faces 
-
-python -m barnaby.face_memory enroll   --name "namehere"   --source 0   --samples 5
-
 ```
 
-Use `--source 1` if the camera is on a different index.
-Add `--headless` when running over SSH or without a desktop.
-Press Q in the preview or Ctrl+C in the terminal to stop.
+Try `--source 1`, `--source 2`, etc. if the camera is on another device. A single camera may expose several `/dev/video*` nodes.
 
-Without a webcam, download and run the sample video:
+Press **Q** in Barnaby's preview window to stop, or **Ctrl+C** in the terminal. Use `--headless` when no GUI preview is needed.
 
-```bash
-python -m barnaby.demo
-```
+### Optional: Raspberry Pi CSI/ribbon camera
 
-Add `--once --headless` to run it once over SSH.
-
-## Pi CSI camera
-
-For a Camera Module plugged into the Pi's camera connector, use this setup
-instead of the USB webcam environment:
+The current repository provides `--picamera`, but Picamera2 needs Raspberry Pi OS camera packages. Use a **separate environment** so the system's libcamera bindings remain visible:
 
 ```bash
 sudo apt install -y python3-picamera2 python3-opencv python3-numpy
 python3 -m venv --system-site-packages .venv-camera
 source .venv-camera/bin/activate
 python -m pip install --no-deps -e .
-python -m barnaby --check
-python -m barnaby --picamera --headless
+python -m pip install piper-tts google-genai python-dotenv pygame
+python -c 'import cv2; print(cv2.__version__)'
+python -m barnaby --picamera
 ```
 
-This requires the OS OpenCV package to be version 4.10 or newer.
-Remove `--headless` to show the preview on a desktop.
+**Requirement:** `vision.py` checks for OpenCV **4.10 or newer**. Some Raspberry Pi OS releases ship an older `python3-opencv`; if the version check fails, the CSI environment needs an updated compatible OpenCV setup before it will run. The USB webcam setup is simpler. The standalone `face_memory enroll/test` CLI currently uses `cv2.VideoCapture` for live cameras; for a CSI camera, enroll from photos or adapt that CLI to Picamera2.
 
-## After PC changes
+## 5. Set up sound effects and Bluetooth/HDMI audio
 
-Commit and push on the PC. Then, from the repo folder on the Pi:
+The repository currently has:
+
+```text
+sounds/effects/growl.wav
+sounds/effects/sexy.wav
+```
+
+The current `src/barnaby/sounds.py` mappings are `middle_finger -> growl.wav` and `peace -> sexy.wav`, with a five-second per-effect cooldown. Add or change mappings in the `EFFECTS` dictionary there; `src/barnaby/reactions.py` calls `audio.play(...)` for stable gesture/expression events. Background music playback is **not yet implemented** in the current `sounds.py`.
+
+On the Pi, use PipeWire to route **Piper's `pw-play` audio** to the right output:
+
+```bash
+wpctl status
+```
+
+Under **Audio → Sinks**, find your Bluetooth speaker or desired HDMI/USB output. Then:
+
+```bash
+wpctl set-default SINK_ID
+pw-play sounds/effects/growl.wav
+```
+
+Replace `SINK_ID` with the number shown by `wpctl status`. If the speaker is not listed, first connect it in Raspberry Pi OS Bluetooth settings. `pygame` uses SDL's audio backend, which may need the same selected system output; if it chooses the wrong backend, try running Barnaby as `SDL_AUDIODRIVER=pulse python -m barnaby ...` from a logged-in desktop/audio session.
+
+## 6. Enroll known faces (with permission)
+
+Face recognition uses **YuNet + SFace** locally. The database is `data/faces.db` and stores numerical face embeddings. A face must be sufficiently clear, at least ~75 pixels across its smaller bounding-box dimension, and be **the only detected face** in the enrollment image. Start from the project root.
+
+### Enroll from the webcam
+
+```bash
+python -m barnaby.face_memory enroll --name 'Alex' --source 0 --samples 5
+```
+
+Press **Space** five times, changing head angle and lighting between captures. **Q** cancels the enrollment.
+
+### Enroll from a folder of photographs
+
+```bash
+mkdir -p pictures/Alex
+# Add Alex's JPG/PNG photos under pictures/Alex/
+python -m barnaby.face_memory enroll \
+  --name 'Alex' \
+  --images pictures/Alex/*.jpg pictures/Alex/*.png
+```
+
+You can also use uppercase filename globs if needed (`*.JPG`, `*.PNG`). **Paths are relative to the current directory**, so either run from the repo root as shown or adjust paths accordingly. Re-enrolling the same name **replaces** its prior samples.
+
+For HEIC/HEIF photographs copied from an iPad (Linux):
+
+```bash
+sudo apt install -y libheif-examples
+for file in pictures/Alex/*.HEIC; do
+  [ -f "$file" ] || continue
+  heif-convert "$file" "${file%.*}.jpg"
+done
+```
+
+Run the conversion from the project root. If already inside `pictures/Alex/`, change the glob to `*.HEIC`. JPEG or PNG is needed for the existing `cv2.imread` enrollment flow.
+
+### List, test, and remove people
+
+```bash
+python -m barnaby.face_memory list
+python -m barnaby.face_memory test --source 0
+python -m barnaby.face_memory delete --name 'Alex'
+```
+
+`test` displays the recognized name and cosine similarity. The default acceptance threshold is `0.50`, and `--threshold` lets you adjust it for testing. **Face matching is probabilistic**; test on different people and lighting conditions, and treat uncertain matches as unknown. During the main Barnaby run, a person must be matched in two consecutive checks before the name is accepted. The current implementation handles **one face at a time**.
+
+## 7. Start the complete Barnaby pipeline
+
+With a USB webcam, enrolled people, Gemini configured, and working audio:
+
+```bash
+python -m barnaby \
+  --source 0 \
+  --faces \
+  --face-interval 1.5 \
+  --face-threshold 0.50 \
+  --scene \
+  --scene-model gemini-3.5-flash-lite \
+  --scene-interval 45 \
+  --scene-timeout 90 \
+  --scene-image-width 320 \
+  --threads 2
+```
+
+- `--faces` loads enrolled identities from `data/faces.db` and runs SFace at the face interval.
+- When Barnaby has a confirmed name, the Gemini request **includes that name** in the text prompt alongside the camera image. If the identity is unknown, it does not supply a name.
+- `--scene` submits frames to Gemini. Only requests are spaced by `--scene-interval`; API latency affects the actual response timing.
+- `--threads` controls OpenCV's CPU thread setting; it does not allocate Gemini or Piper worker threads. Start with 2 on a Pi 5 and measure performance before increasing it.
+- Piper speaks the returned dialogue if `BARNABY_TTS=1` is set.
+- Stable local gestures and expressions can trigger prerecorded sounds through pygame.
+
+Run without cloud access:
+
+```bash
+python -m barnaby --source 0 --faces --threads 2
+```
+
+Run without a visible preview (e.g., over SSH):
+
+```bash
+python -m barnaby --source 0 --faces --scene \
+  --scene-model gemini-3.5-flash-lite --headless
+```
+
+**Audio caveat:** PipeWire and SDL generally depend on an active user audio session. A headless SSH run may require audio-session configuration; don't run Barnaby as root just to fix audio routing.
+
+## 8. Files you will edit
+
+| File | Purpose |
+| --- | --- |
+| `src/barnaby/app.py` | Camera loop, CLI arguments, model coordination |
+| `src/barnaby/gestures.py` | Hand-landmark gesture rules (`shaka`, `horns`, etc.) |
+| `src/barnaby/vision.py` | Hand, face and expression inference |
+| `src/barnaby/face_memory.py` | Face enrollment, SFace matching and SQLite |
+| `src/barnaby/scene.py` | Gemini scene prompt, recognized-name context |
+| `src/barnaby/speech.py` | Piper TTS, SoX effects and `pw-play` |
+| `src/barnaby/sounds.py` | Prerecorded sound mappings/cooldowns |
+| `src/barnaby/reactions.py` | Gesture/expression events, speech and sounds |
+| `src/barnaby/models.py` | Download/verify the four pinned baseline models |
+| `.env` | Local Gemini API key and TTS setting; never commit |
+
+### Updating an existing installation
 
 ```bash
 git pull --ff-only
 source .venv/bin/activate
-python -m barnaby --source 0 --headless
+python -m pip install --only-binary=:all: -r requirements.txt
+python -m pip install piper-tts google-genai python-dotenv pygame
 ```
 
-Use `.venv-camera/bin/activate` and `--picamera` for a CSI camera.
-If dependencies changed, repeat the install command for your environment.
+If a new version adds another model or dependency, follow its release instructions. Your `.env`, enrollment photos and database should be treated as machine-local private data rather than being overwritten by Git.
 
-## Where to edit
+## 9. Important privacy/security cleanup
 
-- `src/barnaby/reactions.py`: add Barnaby's reactions to detected gestures/expressions.
-- `src/barnaby/gestures.py`: change the gesture rules.
-- `src/barnaby/vision.py`: change model inference.
+**The current repository snapshot contains tracked `data/faces.db` and photos in `pictures/`.** Adding paths to `.gitignore` does **not** remove already tracked files. Face embeddings are biometric data, and original photos should not be publicly distributed without the person's permission. From a trusted development machine, after making a secure backup if needed:
 
-The current gestures are open palm, fist, peace, pointing, and thumbs up.
-Expression labels describe facial appearance. Motion gestures such as waving
-are not implemented yet.
+```bash
+printf '\ndata/\npictures/\n' >> .gitignore
+git rm -r --cached --ignore-unmatch data pictures
+git add .gitignore
+git commit -m 'Stop tracking face data and enrollment photos'
+git push
+```
+
+`--cached` removes the files from future Git snapshots **without deleting the local copies**. **It does not erase them from earlier public commits/history**; if they were published, address the history separately and treat the data as already exposed. Future fresh clones will need people to enroll again or have `faces.db` securely transferred. Never commit `.env`, API keys, photos, or face embeddings. Enroll only people who have agreed to be recognized, and provide a way to remove their records.
+
+Because this Pi previously had unexpected SSH activity, secure/rebuild it before storing more face data or reusing API keys. Avoid publicly exposing password-authenticated root SSH.
+
+## 10. Troubleshooting
+
+| Problem | Try |
+| --- | --- |
+| `No module named dotenv / pygame / piper / google.genai` | Activate `.venv`; install the extra Python packages in step 1 |
+| `pygame.error: Couldn't open audio device` | Select an audio output, start from an active desktop audio session, or temporarily use `SDL_AUDIODRIVER=dummy` for silent model checks |
+| `No such file or directory: pwplay` | The executable is **`pw-play`**; install `pipewire-bin` and check `speech.py` |
+| Sound plays through the monitor | `wpctl status`, then `wpctl set-default SINK_ID` for Bluetooth/USB |
+| `GEMINI_API_KEY must be set` | Put it in `.env` at the repo root; check that `python-dotenv` is installed |
+| `Missing model: ...SFace...` | Download SFace in step 2; it is Git-ignored |
+| `Could not open camera/video` | `v4l2-ctl --list-devices`; change `--source` |
+| Images skipped during enrollment | Use JPG/PNG, good lighting, one face in frame, and correct relative paths |
+| Face not recognized | Try several higher-quality enrollment images and inspect similarity with `face_memory test` |
+| CSI camera fails due to OpenCV version | Check `python -c 'import cv2; print(cv2.__version__)'`; code requires 4.10+ |
+| Voice model found but no audio | Check `sox`, `pw-play`, `wpctl status`, and `BARNABY_TTS=1` |
+
+To inspect every supported launch flag:
+
+```bash
+python -m barnaby --help
+python -m barnaby.face_memory --help
+```
+
+---
+
+**Status:** Setup documented from the currently committed repository code. Hardware-specific camera, audio and library combinations still require on-device verification. The current project does not yet include a relay/GPIO-control implementation or automatic music-looping logic in the committed sound module.

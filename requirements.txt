@@ -1,4 +1,21 @@
-# Tested desktop/USB-camera environment. ARM64 wheels are available.
+
+# Barnaby Bear - Python Dependencies
+# Raspberry Pi 5 (64-bit) / Linux
+# Python 3.10-3.13
+
+# Computer vision
 numpy==2.2.6
 opencv-python==4.12.0.88
+
+# Gemini API and environment variables
+google-genai
+python-dotenv
+
+# Offline text-to-speech
+piper-tts
+
+# Sound effects and background audio
+pygame
+
+# Install Barnaby itself in editable mode
 -e .
