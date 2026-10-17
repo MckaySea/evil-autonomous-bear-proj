@@ -1,49 +1,47 @@
+"""Blocking sound-effect playback, called only by the shared audio worker."""
+
 from pathlib import Path
-import time
-import pygame
 
 ROOT = Path(__file__).resolve().parents[2]
 SOUND_DIR = ROOT / "sounds"
 
 EFFECTS = {
     "middle_finger": "growl.wav",
-    "peace": "sexy.wav"
+    "peace": "sexy.wav",
 }
 
 
 class BarnabyAudio:
     def __init__(self):
-        pygame.mixer.init(
-            frequency=44100,
-            size=-16,
-            channels=2,
-            buffer=512,
-        )
+        import pygame
 
+        self._mixer = pygame.mixer
+        self._mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
         self.effects = {}
-        self.last_played = {}
-        self.cooldown = 5.0
 
-        for event, filename in EFFECTS.items():
-            path = SOUND_DIR / "effects" / filename
-
-            if path.exists():
-                self.effects[event] = pygame.mixer.Sound(str(path))
-                self.effects[event].set_volume(0.6)
-
-    def play(self, event):
+    def play(self, event, stop, is_fresh) -> bool:
+        if event not in EFFECTS or stop.is_set():
+            return False
         if event not in self.effects:
-            return
+            path = SOUND_DIR / "effects" / EFFECTS[event]
+            if not path.is_file():
+                raise FileNotFoundError(f"Sound effect not found: {path}")
+            sound = self._mixer.Sound(str(path))
+            sound.set_volume(0.6)
+            self.effects[event] = sound
+        if not is_fresh():
+            return False
+        channel = self.effects[event].play()
+        if channel is None:
+            raise RuntimeError("No audio channel available for sound effect")
+        try:
+            while channel.get_busy():
+                if stop.wait(0.02):
+                    break
+        finally:
+            if stop.is_set():
+                channel.stop()
+        return True
 
-        now = time.monotonic()
-
-        if now - self.last_played.get(event, -float("inf")) < self.cooldown:
-            return
-
-        self.effects[event].play()
-        self.last_played[event] = now
-
-
-
-    def stop_music(self):
-        pygame.mixer.music.stop()
+    def close(self) -> None:
+        self._mixer.quit()

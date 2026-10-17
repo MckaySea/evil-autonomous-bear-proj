@@ -10,13 +10,16 @@ import time
 import cv2
 
 from .camera import Camera
+from .audio_coordinator import AudioSettings
 from .face_memory import FaceMemory, DEFAULT_THRESHOLD
 from .gestures import HAND_CONNECTIONS, StableLabel
 from .models import DEFAULT_MODEL_DIR
-from .reactions import PerceptionEvent, on_perception, on_scene_description
+from .reactions import (
+    PerceptionEvent, configure_audio, on_perception, on_scene_description,
+    stop_audio, wants_scene_description,
+)
 from .scene import MODEL, describe_scene
 from .vision import Observation, Vision
-from pathlib import Path
 from dotenv import load_dotenv
 
 def positive(value: str) -> int:
@@ -76,8 +79,28 @@ def main(argv=None) -> None:
                         help="Gemini request timeout in seconds")
     parser.add_argument("--scene-image-width", type=positive, default=512,
                         help="Maximum width of image submitted to Gemini")
+    parser.add_argument("--observation-expiry", type=float, default=8.0,
+                        help="Maximum observation age at speech start, from image capture (seconds)")
+    parser.add_argument("--effect-expiry", type=float, default=5.0,
+                        help="Discard sound effects waiting this many seconds")
+    parser.add_argument("--effect-cooldown", type=float, default=5.0,
+                        help="Seconds after an effect finishes before it can trigger again")
+    parser.add_argument("--audio-gap", type=float, default=1.0,
+                        help="Minimum silence between audio items (seconds)")
+    parser.add_argument("--gesture-release", type=float, default=0.5,
+                        help="Seconds a gesture must be absent before it can trigger again")
     args = parser.parse_args(argv)
 
+    try:
+        audio_settings = AudioSettings(
+            observation_expiry=args.observation_expiry,
+            effect_expiry=args.effect_expiry,
+            effect_cooldown=args.effect_cooldown,
+            playback_gap=args.audio_gap,
+            gesture_release=args.gesture_release,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if not math.isfinite(args.interval) or args.interval < 0:
         parser.error("--interval must be finite and nonnegative")
     if not math.isfinite(args.scene_interval) or args.scene_interval <= 0:
@@ -98,6 +121,7 @@ def main(argv=None) -> None:
     writer = None
     scene_executor = None
     scene_future = None
+    scene_captured_at = 0.0
     next_scene_at = 0.0
     face_memory = None
     next_face_at = 0.0
@@ -111,6 +135,7 @@ def main(argv=None) -> None:
             print(f"All four models verified and ran on CPU (OpenCV {cv2.__version__}).")
             return
 
+        configure_audio(audio_settings)
         if args.faces:
             face_memory = FaceMemory(args.model_dir)
             print("Local SFace recognition enabled; requires two matching checks")
@@ -119,7 +144,6 @@ def main(argv=None) -> None:
             scene_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="barnaby-gemini")
 
         gesture_filter, expression_filter = StableLabel(args.stable_frames), StableLabel(args.stable_frames)
-        previous = ("none", "none")
         count, next_inference = 0, 0.0
         observation = Observation()
         print("Barnaby vision running. Press Q in the preview or Ctrl+C to stop.")
@@ -128,6 +152,7 @@ def main(argv=None) -> None:
 
         while True:
             ok, frame = camera.read()
+            frame_captured_at = time.monotonic()
             if not ok:
                 if camera.is_file:
                     break
@@ -135,7 +160,7 @@ def main(argv=None) -> None:
             if camera.looped:
                 gesture_filter = StableLabel(args.stable_frames)
                 expression_filter = StableLabel(args.stable_frames)
-                observation, previous, next_inference = Observation(), ("none", "none"), 0.0
+                observation, next_inference = Observation(), 0.0
 
             scale = min(1.0, args.inference_width / frame.shape[1])
             small = cv2.resize(
@@ -149,10 +174,9 @@ def main(argv=None) -> None:
                 observation = vision.infer(small)
                 next_inference = now + args.interval
                 labels = (gesture_filter.update(observation.gesture), expression_filter.update(observation.expression))
-                if labels != previous:
-                    on_perception(PerceptionEvent(*labels, observation.hand_confidence,
-                                                   observation.face_confidence, observation.inference_ms))
-                    previous = labels
+                # Release gates need every sample, not just label changes.
+                on_perception(PerceptionEvent(*labels, observation.hand_confidence,
+                                               observation.face_confidence, observation.inference_ms))
 
             if face_memory is not None and now >= next_face_at:
                 next_face_at = now + args.face_interval
@@ -173,7 +197,7 @@ def main(argv=None) -> None:
                 if scene_future is not None and scene_future.done():
                     try:
                         description = scene_future.result()
-                        on_scene_description(description)
+                        on_scene_description(description, scene_captured_at)
                     except Exception as error:
                         print(f"[Barnaby Gemini error] {error}", flush=True)
                         # Back off after failed requests (e.g., rate limits).
@@ -183,7 +207,9 @@ def main(argv=None) -> None:
 
                 # Sample the original camera frame so people remain visible.
                 # Never queue up overlapping requests if the API is slow.
-                if scene_future is None and time.monotonic() >= next_scene_at:
+                if (scene_future is None and time.monotonic() >= next_scene_at
+                        and wants_scene_description()):
+                    scene_captured_at = frame_captured_at
                     scene_future = scene_executor.submit(
                         describe_scene,
                         frame.copy(),
@@ -220,6 +246,7 @@ def main(argv=None) -> None:
     except (OSError, ValueError, RuntimeError, cv2.error) as error:
         parser.exit(1, f"Barnaby could not start/run: {error}\n")
     finally:
+        stop_audio()
         if scene_executor is not None:
             scene_executor.shutdown(wait=False, cancel_futures=True)
         if face_memory is not None:

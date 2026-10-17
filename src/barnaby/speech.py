@@ -1,205 +1,99 @@
+"""Piper speech preparation and blocking playback for the shared audio worker."""
 
-"""Piper speech with demon voice effects, running in the background."""
-
-import atexit
-import os
 from pathlib import Path
-from queue import Queue, Empty, Full
+import os
 import re
 import shutil
 import subprocess
 import tempfile
-from threading import Thread, Event, Lock
+import time
 import wave
 
 
-VOICE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "voices"
-    / "en_US-ryan-medium.onnx"
-)
+VOICE_PATH = Path(__file__).resolve().parents[2] / "voices" / "en_US-ryan-medium.onnx"
 
 
 def clean_for_speech(text: str) -> str:
     """Remove Gemini's nonspoken stage directions and formatting."""
     text = re.sub(r"\*[^*]*\*", " ", text)
     text = re.sub(r"(?m)^\s*[-#]+\s*", "", text)
-    text = re.sub(r"\s+", " ", text.replace("`", "")).strip()
-    return text
+    return re.sub(r"\s+", " ", text.replace("`", "")).strip()
 
 
-class SpeechWorker:
-    """Process Gemini responses without blocking the camera."""
-
+class SpeechPlayer:
     def __init__(self, voice_path: Path = VOICE_PATH):
         self.voice_path = Path(voice_path)
-        self._queue: Queue[str | None] = Queue(maxsize=1)
-        self._stop = Event()
-        self._thread = Thread(
-            target=self._run,
-            name="barnaby-demon-tts",
-            daemon=True,
-        )
-        self._playback = None
+        self._voice = None
 
-    def start(self) -> None:
+    def _load_voice(self) -> None:
+        if self._voice is not None:
+            return
         if not self.voice_path.is_file():
-            raise FileNotFoundError(
-                f"Piper voice not found: {self.voice_path}"
-            )
-
+            raise FileNotFoundError(f"Piper voice not found: {self.voice_path}")
         for executable in ("sox", "pw-play"):
             if shutil.which(executable) is None:
-                raise RuntimeError(
-                    f"{executable} is missing. Install sox and alsa-utils."
-                )
+                raise RuntimeError(f"{executable} is missing. Install sox and pipewire-bin.")
+        from piper import PiperVoice
 
-        self._thread.start()
-        atexit.register(self.stop)
+        self._voice = PiperVoice.load(str(self.voice_path))
+        print("[Barnaby TTS] Piper voice loaded", flush=True)
 
-    def say(self, text: str) -> None:
-        """Queue the newest response, discarding old pending speech."""
+    @staticmethod
+    def _run_process(command, stop, timeout: float) -> bool:
+        """Drain stderr and stop subprocesses promptly when Barnaby exits."""
+        if stop.is_set():
+            return False
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + timeout
+        try:
+            while not stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{command[0]} timed out")
+                try:
+                    _, errors = process.communicate(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+                if process.returncode != 0:
+                    raise RuntimeError(f"{command[0]} failed: {errors.decode(errors='replace').strip()}")
+                return True
+            return False
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def play(self, text: str, stop, is_fresh) -> bool:
         text = clean_for_speech(text)
-
-        if not text or self._stop.is_set():
-            return
-
-        try:
-            self._queue.put_nowait(text)
-        except Full:
-            try:
-                self._queue.get_nowait()
-            except Empty:
-                pass
-
-            try:
-                self._queue.put_nowait(text)
-            except Full:
-                pass
-
-    def _run(self) -> None:
-        """Load Piper once and process incoming speech requests."""
-        try:
-            from piper import PiperVoice
-
-            voice = PiperVoice.load(str(self.voice_path))
-            print("[Barnaby TTS] Piper voice loaded", flush=True)
-
-        except Exception as error:
-            print(f"[Barnaby TTS] Could not load voice: {error}", flush=True)
-            return
-
-        while not self._stop.is_set():
-            text = self._queue.get()
-
-            if text is None or self._stop.is_set():
-                break
-
-            try:
-                self._play(voice, text)
-            except Exception as error:
-                if not self._stop.is_set():
-                    print(f"[Barnaby TTS] Speech error: {error}", flush=True)
-
-    def _play(self, voice, text: str) -> None:
-        """Convert text to WAV, apply demon effects, and play audio."""
-
-        with tempfile.TemporaryDirectory(
-            prefix="barnaby-tts-"
-        ) as directory:
-
+        if not text or not is_fresh():
+            return False
+        self._load_voice()
+        if not is_fresh():
+            return False
+        with tempfile.TemporaryDirectory(prefix="barnaby-tts-") as directory:
             normal_wav = Path(directory) / "piper.wav"
             demon_wav = Path(directory) / "demon.wav"
-
-            # 1. Generate speech with Piper.
             with wave.open(str(normal_wav), "wb") as wav_file:
-                voice.synthesize_wav(text, wav_file)
-
-            if self._stop.is_set():
-                return
-
-            # 2. Apply Barnaby's demon voice effects.
-            subprocess.run(
-                [
-                    "sox",
-                    str(normal_wav),
-                    str(demon_wav),
-                    "pitch", "-650",
-                    "tempo", "0.90",
-                    "reverb", "30",
-                ],
-                check=True,
-                timeout=60,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-            if self._stop.is_set():
-                return
-
-            # 3. Play through Raspberry Pi audio output.
-            process = subprocess.Popen(
-                ["pw-play", str(demon_wav)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-
-            self._playback = process
-
-            try:
-                _, errors = process.communicate(timeout=120)
-
-                if process.returncode != 0 and not self._stop.is_set():
-                    raise RuntimeError(
-                        "aplay failed: "
-                        + errors.decode(errors="replace").strip()
-                    )
-
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate()
-
-                self._playback = None
-
-    def stop(self) -> None:
-        """Stop speech when Barnaby exits."""
-        self._stop.set()
-
-        process = self._playback
-        if process is not None and process.poll() is None:
-            process.terminate()
-
-        try:
-            self._queue.put_nowait(None)
-        except Full:
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(None)
-            except (Empty, Full):
-                pass
-
-        if self._thread.is_alive():
-            self._thread.join(timeout=2)
+                self._voice.synthesize_wav(text, wav_file)
+            if not is_fresh():
+                return False
+            if not self._run_process(
+                ["sox", str(normal_wav), str(demon_wav),
+                 "pitch", "-650", "tempo", "0.90", "reverb", "30"],
+                stop, 60,
+            ):
+                return False
+            # API time, queue time, voice loading, synthesis and effects all count.
+            if not is_fresh():
+                return False
+            return self._run_process(["pw-play", str(demon_wav)], stop, 120)
 
 
-_worker: SpeechWorker | None = None
-_worker_lock = Lock()
+def speak(text: str, captured_at: float | None = None) -> None:
+    """Compatibility entry point; speech uses the same queue as effects."""
+    if os.environ.get("BARNABY_TTS") == "1":
+        from .reactions import get_audio
 
-
-def speak(text: str) -> None:
-    """Send Gemini's text to the demon voice worker."""
-    global _worker
-
-    if os.environ.get("BARNABY_TTS") != "1":
-        return
-
-    if _worker is None:
-        with _worker_lock:
-            if _worker is None:
-                worker = SpeechWorker()
-                worker.start()
-                _worker = worker
-
-    _worker.say(text)
+        get_audio().submit_observation(
+            clean_for_speech(text), time.monotonic() if captured_at is None else captured_at,
+        )

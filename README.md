@@ -39,7 +39,7 @@ python -m pip install --only-binary=:all: -r requirements.txt
 python -m pip install piper-tts google-genai python-dotenv pygame
 ```
 
-**Important:** `requirements.txt` currently installs the core vision dependencies only. `pygame`, `piper-tts`, `google-genai` and `python-dotenv` must also be installed; `reactions.py` currently initializes pygame audio at import time, even for local-only runs. `pygame` needs a working audio device or SDL dummy output (see Troubleshooting).
+**Important:** `requirements.txt` currently installs the core vision dependencies only. The full Pi setup also needs `pygame`, `piper-tts`, `google-genai` and `python-dotenv`. Audio libraries and devices initialize only when playback is needed; importing reactions or running `--check` does not initialize pygame. The queue and cooldown logic uses only Python's standard library.
 
 Always run Barnaby commands from the **repository root**, where `models/`, `sounds/` and `.env` reside. Activate `.venv` in every new terminal:
 
@@ -100,7 +100,7 @@ print(f'SFace loaded successfully ({path.stat().st_size / 1e6:.1f} MB)')
 PY
 ```
 
-If `--check` fails before this download, it may be because pygame audio initialization failed; see Troubleshooting. The `--check` command verifies only the four baseline networks, not SFace.
+The `--check` command verifies only the four baseline networks, not SFace, and does not initialize audio.
 
 ## 3. Set up Gemini and Piper speech
 
@@ -179,7 +179,21 @@ sounds/effects/growl.wav
 sounds/effects/sexy.wav
 ```
 
-The current `src/barnaby/sounds.py` mappings are `middle_finger -> growl.wav` and `peace -> sexy.wav`, with a five-second per-effect cooldown. Add or change mappings in the `EFFECTS` dictionary there; `src/barnaby/reactions.py` calls `audio.play(...)` for stable gesture/expression events. Background music playback is **not yet implemented** in the current `sounds.py`.
+The `src/barnaby/sounds.py` mappings are `middle_finger -> growl.wav` and `peace -> sexy.wav`. Add or change mappings in the `EFFECTS` dictionary there. Background music playback is **not yet implemented**.
+
+Speech and effects share one audio worker, so they never play over each other. A held gesture triggers once and must disappear for 0.5 seconds before it can trigger again. Facial-expression changes do not retrigger the held hand gesture. A gesture attempted during its cooldown is ignored until it is released and performed again.
+
+The queue holds at most two waiting effects and the newest waiting observation. Duplicates are ignored. A waiting observation can have at most one effect ahead of it (including an effect already playing); replacing its text preserves that turn. Expired items are discarded, and audio already playing finishes without interruption.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--observation-expiry` | `8` | Maximum seconds from camera capture to speech starting, including Gemini latency and Piper/SoX preparation |
+| `--effect-expiry` | `5` | Maximum seconds an effect can wait before starting |
+| `--effect-cooldown` | `5` | Seconds after an effect finishes before the same effect can trigger again |
+| `--audio-gap` | `1` | Minimum seconds of silence between playback items |
+| `--gesture-release` | `0.5` | Seconds a gesture/expression must be absent to rearm its trigger |
+
+For more frequent observations, add `--scene-interval 5 --observation-expiry 8` to your launch command. The request interval defaults to 10 seconds; it is separate from expiry. Only one Gemini request runs at once, and new requests wait while an observation is queued, being prepared, or being spoken. Sound effects alone do not prevent requests. If Gemini plus speech preparation takes longer than the expiry, that observation is skipped; choose an expiry between 5 and 10 seconds to match the Pi's measured response times.
 
 On the Pi, use PipeWire to route **Piper's `pw-play` audio** to the right output:
 
@@ -254,7 +268,8 @@ python -m barnaby \
   --face-threshold 0.50 \
   --scene \
   --scene-model gemini-3.5-flash-lite \
-  --scene-interval 45 \
+  --scene-interval 5 \
+  --observation-expiry 8 \
   --scene-timeout 90 \
   --scene-image-width 320 \
   --threads 2
@@ -262,7 +277,7 @@ python -m barnaby \
 
 - `--faces` loads enrolled identities from `data/faces.db` and runs SFace at the face interval.
 - When Barnaby has a confirmed name, the Gemini request **includes that name** in the text prompt alongside the camera image. If the identity is unknown, it does not supply a name.
-- `--scene` submits frames to Gemini. Only requests are spaced by `--scene-interval`; API latency affects the actual response timing.
+- `--scene` submits frames to Gemini. Requests are spaced by at least `--scene-interval` and wait for any pending/active spoken observation. API latency affects actual response timing; observations expire from camera capture time.
 - `--threads` controls OpenCV's CPU thread setting; it does not allocate Gemini or Piper worker threads. Start with 2 on a Pi 5 and measure performance before increasing it.
 - Piper speaks the returned dialogue if `BARNABY_TTS=1` is set.
 - Stable local gestures and expressions can trigger prerecorded sounds through pygame.
@@ -292,7 +307,8 @@ python -m barnaby --source 0 --faces --scene \
 | `src/barnaby/face_memory.py` | Face enrollment, SFace matching and SQLite |
 | `src/barnaby/scene.py` | Gemini scene prompt, recognized-name context |
 | `src/barnaby/speech.py` | Piper TTS, SoX effects and `pw-play` |
-| `src/barnaby/sounds.py` | Prerecorded sound mappings/cooldowns |
+| `src/barnaby/sounds.py` | Prerecorded sound mappings and blocking playback |
+| `src/barnaby/audio_coordinator.py` | Shared audio queue, expiry, cooldowns, release gates and playback worker |
 | `src/barnaby/reactions.py` | Gesture/expression events, speech and sounds |
 | `src/barnaby/models.py` | Download/verify the four pinned baseline models |
 | `.env` | Local Gemini API key and TTS setting; never commit |
@@ -307,6 +323,23 @@ python -m pip install piper-tts google-genai python-dotenv pygame
 ```
 
 If a new version adds another model or dependency, follow its release instructions. Your `.env`, enrollment photos and database should be treated as machine-local private data rather than being overwritten by Git.
+
+### Test audio scheduling without installing dependencies
+
+These tests use a simulated clock, fake playback and mocked hardware libraries. Python's `-S` option disables site packages, verifying that the audio logic needs no project dependencies.
+
+```powershell
+# Windows PowerShell, from the repository root
+$env:PYTHONPATH = "src"
+python -S -m unittest discover -s tests -p test_audio.py -v
+```
+
+```bash
+# Linux / Raspberry Pi
+PYTHONPATH=src python3 -S -m unittest discover -s tests -p test_audio.py -v
+```
+
+Actual camera, Piper performance and speaker playback still need verification on the Pi.
 
 ## 9. Important privacy/security cleanup
 
