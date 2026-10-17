@@ -2,9 +2,12 @@
 
 from dataclasses import dataclass
 import json
+from .sounds import BarnabyAudio
 
 from .speech import speak
 
+
+audio = BarnabyAudio()
 
 @dataclass(frozen=True)
 class PerceptionEvent:
@@ -16,10 +19,11 @@ class PerceptionEvent:
 
 
 def on_perception(event: PerceptionEvent) -> None:
-    """Called on stable gesture/expression changes."""
     print(json.dumps(event.__dict__), flush=True)
-    if event.gesture == "middle_finger":
-        speak("You suck man")
+
+    audio.play(event.gesture)
+    audio.play(event.expression)
+    
 
 
 
